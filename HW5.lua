@@ -7,7 +7,7 @@ cmd = torch.CmdLine()
 
 -- Cmd Args
 cmd:option('-datafile', '', 'data file')
-cmd:option('-classifier', 'nb', 'classifier to use')
+cmd:option('-classifier', 'hmm', 'classifier to use')
 
 -- Hyperparameters
 -- ...
