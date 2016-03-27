@@ -1,0 +1,7 @@
+1 O
+2 I-PER
+3 I-LOC
+4 I-ORG
+5 I-MISC
+6 B-MISC
+7 B-LOC
