@@ -14,42 +14,81 @@ cmd:option('-beta', 1, 'beta for F-Score')
 cmd:option('-laplace', 0, 'added counts for laplace smoothing')
 
 -- ...
-function hmm(inputs, targets, valid_inputs, valid_targets, test)
-	local initial = torch.Tensor(nclasses):fill(0)
+function hmm(inputs, targets)
+	local initial = torch.Tensor(nclasses,1):fill(0)
 	initial[targets[1]] = 1.0
-	local transition = torch.Tensor(nclasses, nclasses):fill(0)
-	local emission = torch.Tensor(nclasses, nfeatures):fill(opt.laplace)
+	local transition = torch.Tensor(nclasses, nclasses):fill(opt.laplace)
+	local emission = torch.Tensor(nfeatures, nclasses):fill(opt.laplace)
 
 	--train transition and emission
-	local statecount = torch.Tensor(nclasses, nclasses):fill(0)
-	local emissioncount = torch.Tensor(nclasses, nfeatures):fill(opt.laplace*nclasses)
+	local statecount = torch.Tensor(nclasses, nclasses):fill(opt.laplace*nclasses)
+	local emissioncount = torch.Tensor(nclasses, nfeatures):fill(opt.laplace*nfeatures)
 	local prevstate = targets[1]
 	for i=1, targets:size(1) do
 		--count transitions
-		transition[prevstate][targets[i]] = transition[prevstate][targets[i]] + 1
+		transition[targets[i]][prevstate] = transition[targets[i]][prevstate] + 1
 		prevstate = targets[i]
 		--count emissions
-		emission[prevstate][inputs[i]] = emission[prevstate][inputs[i]] + 1
+		emission[inputs[i]][prevstate] = emission[inputs[i]][prevstate] + 1
 		--update count matrices (for later division)
 		statecount:narrow(2, prevstate, 1):add(1)
-		emissioncount:narrow(2, inputs[i], 1):add(1)
+		emissioncount:narrow(2, prevstate, 1):add(1)
 	end	
 	transition:cdiv(statecount)
 	emission:cdiv(emissioncount)
-	print(emission:narrow(2, 1, 10))
+
+	return initial:log(), emission:log(), transition:log()
 end
 
-function memm(inputs, targets, valid_inputs, valid_targets, test)
+function score_hmm(observations, i)
+    local observation_emission = emission[observations[i]]:view(nclasses, 1):expand(nclasses, nclasses)
+    -- NOTE: allocates a new Tensor
+    return observation_emission + transition
+end
+
+function memm(inputs, targets)
 
 end
 
-function sperc(inputs, targets, valid_inputs, valid_targets, test)
+function sperc(inputs, targets)
 
 end
 
-function viterbi()
+function viterbi(observations, logscore)
+    local n = observations:size(1)
+    local max_table = torch.Tensor(n, nclasses)
+    local backpointer_table = torch.Tensor(n, nclasses)
 
+    -- first timestep
+    -- the initial most likely paths are the initial state distribution
+    -- NOTE: another unnecessary Tensor allocation here
+    local maxes, backpointers = (initial + emission[observations[1]]):max(2)
+    max_table[1] = maxes
+
+    -- remaining timesteps ("forwarding" the maxes)
+    for i=2,n do
+        -- precompute edge scores
+        y = logscore(observations, i)
+        scores = y + maxes:view(1, nclasses):expand(nclasses, nclasses)
+
+        -- compute new maxes (NOTE: another unnecessary Tensor allocation here)
+        maxes, backpointers = scores:max(2)
+
+        -- record
+        max_table[i] = maxes
+        backpointer_table[i] = backpointers
+    end
+
+    -- follow backpointers to recover max path
+    local classes = torch.Tensor(n)
+    maxes, classes[n] = maxes:max(1)
+    for i=n,2,-1 do
+        classes[i-1] = backpointer_table[{i, classes[i]}]
+    end
+
+    return classes
 end
+
 
 
 
@@ -95,7 +134,12 @@ function main()
 
 	-- Train.
 	if opt.classifier == 'hmm' then
-		hmm(train_input, train_target, valid_input, valid_target, test_input)
+		initial, emission, transition = hmm(train_input, train_target)
+		-- print(viterbi(valid_input:narrow(1,1,15), score_hmm))
+		-- print(valid_target:narrow(1,1,15))
+		first15score = fscore(viterbi(valid_input:narrow(1,1,15), score_hmm), valid_target:narrow(1,1,15))
+		print(first15score)
+
 	end
 	-- Test.
 end
