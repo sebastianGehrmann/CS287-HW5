@@ -13,6 +13,23 @@ cmd:option('-classifier', 'hmm', 'classifier to use')
 cmd:option('-beta', 1, 'beta for F-Score')
 
 -- ...
+function hmm(inputs, targets, valid_inputs, valid_targets, test)
+
+end
+
+function memm(inputs, targets, valid_inputs, valid_targets, test)
+
+end
+
+function sperc(inputs, targets, valid_inputs, valid_targets, test)
+
+end
+
+function viterbi()
+
+end
+	
+
 
 
 function fscore(yhat, y)
@@ -20,8 +37,7 @@ function fscore(yhat, y)
 	local precision = 0
 	local recall = 0
 	for i=1, yhat:size(1) do
-		--true predictions
-		
+		--true predictions	
 		if yhat[i] > 1 and yhat[i] < 8 and y[i] == yhat[i] then
 			precision = precision + 1
 		end
@@ -30,7 +46,6 @@ function fscore(yhat, y)
 			recall = recall + 1
 		end
 	end
-
 	local score = (opt.beta^2 + 1) * precision * recall / 
 						(opt.beta^2 * precision + recall)
 	return score
@@ -55,7 +70,7 @@ function main()
    --test the f-score function
    test_tensor = torch.Tensor(10):fill(2)
    assert(fscore(test_tensor, test_tensor), 10)
-   
+
    -- Train.
 
    -- Test.
