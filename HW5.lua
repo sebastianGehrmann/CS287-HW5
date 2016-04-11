@@ -89,10 +89,6 @@ function viterbi(observations, logscore)
     return classes
 end
 
-
-
-
-
 function fscore(yhat, y)
 	--fscore for one-dimensional vector
 	local precision = 0
@@ -109,8 +105,26 @@ function fscore(yhat, y)
 	end
 	local score = (opt.beta^2 + 1) * precision * recall / 
 						(opt.beta^2 * precision + recall)
-	return score
+	return math.max(score, 0)
 end
+
+function sentenceFscore(inputs, targets, logscore)
+	sentence_count = 0
+	fscore_sum = 0
+
+	begin_index = 1
+	for index=2, inputs:size(1) do
+		if inputs[index] == 2 then
+			current_prediction = viterbi(inputs:narrow(1, begin_index, index-begin_index), logscore)
+			current_fscore = fscore(current_prediction, targets:narrow(1, begin_index, index-begin_index))
+			begin_index = index
+			sentence_count = sentence_count + 1
+			fscore_sum = fscore_sum + current_fscore
+		end
+	end
+	return fscore_sum/sentence_count
+end
+
 
 function main() 
 	-- Parse input params
@@ -137,8 +151,11 @@ function main()
 		initial, emission, transition = hmm(train_input, train_target)
 		-- print(viterbi(valid_input:narrow(1,1,15), score_hmm))
 		-- print(valid_target:narrow(1,1,15))
-		first15score = fscore(viterbi(valid_input:narrow(1,1,15), score_hmm), valid_target:narrow(1,1,15))
-		print(first15score)
+		-- first15score = fscore(viterbi(valid_input:narrow(1,1,15), score_hmm), valid_target:narrow(1,1,15))
+		-- print(first15score)
+		print ("Average Training F-Score is " .. sentenceFscore(train_input, train_target, score_hmm))
+		print ("Average Validation F-Score is " .. sentenceFscore(valid_input, valid_target, score_hmm))
+		
 
 	end
 	-- Test.
