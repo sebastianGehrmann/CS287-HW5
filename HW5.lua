@@ -11,7 +11,10 @@ cmd:option('-classifier', 'hmm', 'classifier to use')
 
 -- Hyperparameters
 cmd:option('-beta', 1, 'beta for F-Score')
-cmd:option('-laplace', 0, 'added counts for laplace smoothing')
+cmd:option('-laplace', 1, 'added counts for laplace smoothing')
+cmd:option('-batchsize', 20, 'Batches to train at once')
+cmd:option('-eta', 0.00004, 'Training eta')
+cmd:option('-epochs', 20, 'Epochs to train for')
 
 -- ...
 function hmm(inputs, targets)
@@ -46,15 +49,101 @@ function score_hmm(observations, i)
     return observation_emission + transition
 end
 
-function memm(inputs, targets)
+function reshapeTrainingData(inputs, targets)
+	newInput = torch.Tensor(inputs:size(1)-1, 2)
+	newInput:narrow(2,1,1):copy(inputs:narrow(1,2,inputs:size(1)-1))
+	newInput:narrow(2,2,1):copy(targets:narrow(1,1,inputs:size(1)-1))
+
+	newTargets = torch.Tensor(inputs:size(1)-1, 1)
+	newTargets:narrow(2,1,1):copy(targets:narrow(1,2,inputs:size(1)-1))
+
+	return newInput, newTargets
+end
+
+function trainNN(model, criterion, input, target, vinput, vtarget)  
+   print(input:size(1), "size of the test set")
+   --SGD after torch nn tutorial and https://github.com/torch/tutorials/blob/master/2_supervised/4_train.lua
+   for i=1, opt.epochs do
+   	  epochLoss = 0
+   	  numBatches = 0
+      --shuffle data
+      shuffle = torch.randperm(input:size(1))
+      --mini batches, yay
+      for t=1, input:size(1), opt.batchsize do
+         xlua.progress(t, input:size(1))
+
+         local inputs = torch.Tensor(opt.batchsize, input:size(2))
+         local targets = torch.Tensor(opt.batchsize)
+         local k = 1
+         for i = t,math.min(t+opt.batchsize-1,input:size(1)) do
+            -- load new sample
+            inputs[k] = input[shuffle[i]]
+            targets[k] = target[shuffle[i]]
+            k = k+1
+         end
+         k=k-1
+         --in case the last batch is < batchsize
+         if k < opt.batchsize then
+           inputs = inputs:narrow(1, 1, k):clone()
+           targets = targets:narrow(1, 1, k):clone()
+         end
+         --zero out
+         model:zeroGradParameters()
+         --predict and compute loss
+         preds = model:forward(inputs)
+         loss = criterion:forward(preds, targets)      
+         dLdpreds = criterion:backward(preds, targets)
+         model:backward(inputs, dLdpreds)
+         model:updateParameters(opt.eta)
+         epochLoss = epochLoss + loss
+         numBatches = numBatches + 1
+      end
+      --predicting accuracy of epoch
+
+      print("\nepoch " .. i .. ", loss: " .. epochLoss/numBatches/opt.batchsize)
+	  
+      _, yhat = model:forward(input):max(2)
+      validationFScore = fscore(yhat:squeeze(), target:squeeze())
+      print(validationFScore, "FScore on whole Training set")
+
+      _, yhat = model:forward(vinput):max(2)
+      validationFScore = fscore(yhat:squeeze(), vtarget:squeeze())
+      print(validationFScore, "FScore on whole Validation set")
+
+	end
+   return model
+end
+
+function memm(inputs, targets, valid, valid_target)	
+	--no using embeddings at this point!
+
+	linLayer = nn.Linear(2,nclasses)
+	softmaxLayer = nn.LogSoftMax()
+
+	model = nn.Sequential()
+	model:add(linLayer):add(softmaxLayer)
+
+	criterion = nn.ClassNLLCriterion()
+	trainNN(model, criterion, inputs, targets, valid, valid_target)
+	return model
+end
+
+function score_memm(observations, i)
+	local scores = torch.Tensor(nclasses, nclasses)
+	for class=1, nclasses do
+		scores:narrow(2,class,1):copy(model:forward(observations[i]))
+	end
+	return scores
 
 end
+	
 
 function sperc(inputs, targets)
 
 end
 
 function viterbi(observations, logscore)
+	--Viterbi adjusted from the section notebook!
     local n = observations:size(1)
     local max_table = torch.Tensor(n, nclasses)
     local backpointer_table = torch.Tensor(n, nclasses)
@@ -62,7 +151,11 @@ function viterbi(observations, logscore)
     -- first timestep
     -- the initial most likely paths are the initial state distribution
     -- NOTE: another unnecessary Tensor allocation here
-    local maxes, backpointers = (initial + emission[observations[1]]):max(2)
+    if opt.classifier == 'hmm' then
+    	maxes, backpointers = (initial + emission[observations[1]]):max(2)
+    else
+    	maxes, backpointers = logscore(observations, 1):max(2)
+    end
     max_table[1] = maxes
 
     -- remaining timesteps ("forwarding" the maxes)
@@ -114,9 +207,9 @@ function sentenceFscore(inputs, targets, logscore)
 
 	begin_index = 1
 	for index=2, inputs:size(1) do
-		if inputs[index] == 2 then
+		if inputs[index][1] == 2 then
 			current_prediction = viterbi(inputs:narrow(1, begin_index, index-begin_index), logscore)
-			current_fscore = fscore(current_prediction, targets:narrow(1, begin_index, index-begin_index))
+			current_fscore = fscore(current_prediction, targets:narrow(1, begin_index, index-begin_index):squeeze())
 			begin_index = index
 			sentence_count = sentence_count + 1
 			fscore_sum = fscore_sum + current_fscore
@@ -155,7 +248,12 @@ function main()
 		-- print(first15score)
 		print ("Average Training F-Score is " .. sentenceFscore(train_input, train_target, score_hmm))
 		print ("Average Validation F-Score is " .. sentenceFscore(valid_input, valid_target, score_hmm))
-		
+	elseif opt.classifier == 'memm' then
+		train_input, train_target = reshapeTrainingData(train_input,train_target)
+		valid_input, valid_target = reshapeTrainingData(valid_input,valid_target)
+		model = memm(train_input, train_target, valid_input, valid_target)
+		print ("Average Training F-Score is " .. sentenceFscore(train_input, train_target, score_memm))
+		print ("Average Validation F-Score is " .. sentenceFscore(valid_input, valid_target, score_memm))
 
 	end
 	-- Test.
