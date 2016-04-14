@@ -26,7 +26,7 @@ def generate_bio2id(filename):
             k,v =line.split()
             bio2id[k] = int(v)
     bio2id['<t>'] = max(bio2id.values())+1
-    bio2id['</t>'] = max(bio2id.values())+1
+    bio2id['</t>'] = max(bio2id.values())+2
     return bio2id
 
 def get_embeddings():
@@ -47,11 +47,11 @@ def get_vocab(filelist, embeddings):
     word2idx["<unk>"] = 1
     word2idx["<s>"] = 2
     word2idx["</s>"] = 3
-    idx=4 
+    idx=4
     for filename in filelist:
         with open(filename, 'r') as f:
             for line in f:
-                #get current word. 
+                #get current word.
                 #Right now, we use only lower case!
                 cword = line.split()
                 if cword:
@@ -119,7 +119,7 @@ FILE_PATHS = {"CONLL": ("data/train.num.txt",
                         "data/dev.num.txt",
                         "data/test.num.txt",
                         "data/tags.txt")}
-args = {} 
+args = {}
 
 def main(arguments):
     global args
@@ -144,6 +144,9 @@ def main(arguments):
     C = len(bio2id)
     V = len(word2idx)
 
+    print "nfeatures", V
+    print "nclasses", C
+
     filename = args.dataset + '.hdf5'
     with h5py.File(filename, "w") as f:
         f['train_input'] = train_input
@@ -152,7 +155,7 @@ def main(arguments):
         f['valid_input'] = valid_input
         f['valid_output'] = valid_target
 
-        f['test_input'] = test_input    
+        f['test_input'] = test_input
 
         f['embeddings'] = idx2embedding
         f['nfeatures'] = np.array([V], dtype=np.int32)
