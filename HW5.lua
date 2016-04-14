@@ -8,19 +8,29 @@ cmd = torch.CmdLine()
 -- Cmd Args
 cmd:option('-datafile', 'CONLL.hdf5', 'data file')
 cmd:option('-classifier', 'hmm', 'classifier to use')
+cmd:option('-outfile', '', 'output file')
 
 -- Hyperparameters
 cmd:option('-beta', 1, 'beta for F-Score')
 cmd:option('-laplace', 1, 'added counts for laplace smoothing')
-cmd:option('-batchsize', 20, 'Batches to train at once')
+cmd:option('-batchsize', 16, 'Batches to train at once')
 cmd:option('-eta', 0.0005, 'Training eta')
 cmd:option('-epochs', 40, 'Epochs to train for')
+cmd:option('-nembed', 50, 'Embedding layer')
+cmd:option('-nhidden', 100, 'Hidden layer')
+cmd:option('-use_embedding', 1, 'Use embedding')
+
+label_map = {
+    [2] = "I-PER",
+    [3] = "I-LOC",
+    [4] = "I-ORG",
+    [5] = "I-MISC",
+    [6] = "B-MISC",
+    [7] = "B-LOC"
+}
 
 -- ...
 function hmm(inputs, targets)
-    local initial = torch.Tensor(nclasses,1):fill(0)
-    initial[initclass] = 1.0
-
     local transition = torch.Tensor(nclasses, nclasses):fill(opt.laplace)
     local emission = torch.Tensor(nfeatures, nclasses):fill(opt.laplace)
 
@@ -41,7 +51,7 @@ function hmm(inputs, targets)
     transition:cdiv(statecount)
     emission:cdiv(emissioncount)
 
-    return initial:log(), emission:log(), transition:log()
+    return emission:log(), transition:log()
 end
 
 function score_hmm(cur)
@@ -51,15 +61,17 @@ function score_hmm(cur)
 end
 
 function reshapeTrainingData(inputs, targets)
-    newInput = torch.Tensor(inputs:size(1)-1, 2):long():fill(0)
-    newInput:narrow(2,1,1):copy(inputs:narrow(1,2,inputs:size(1)-1))
-
-    -- At test time, the second row will be empty
     if targets then
+        newInput = torch.Tensor(inputs:size(1)-1, 2):long():fill(0)
+        newInput:narrow(2,1,1):copy(inputs:narrow(1,2,inputs:size(1)-1))
+
         newInput:narrow(2,2,1):copy(targets:narrow(1,1,inputs:size(1)-1))
 
         newTargets = torch.Tensor(inputs:size(1)-1):long()
         newTargets:copy(targets:narrow(1,2,inputs:size(1)-1))
+    else
+        newInput = torch.Tensor(inputs:size(1), 2):long():fill(0)
+        newInput:narrow(2,1,1):copy(inputs)
     end
 
     return newInput, newTargets
@@ -75,42 +87,42 @@ function trainNN(model, criterion, input, target, vinput, vtarget)
         shuffle = torch.randperm(input:size(1))
         --mini batches, yay
         for t=1, input:size(1), opt.batchsize do
-           xlua.progress(t, input:size(1))
+            xlua.progress(t, input:size(1))
 
-           local inputs = torch.Tensor(opt.batchsize, input:size(2))
-           local targets = torch.Tensor(opt.batchsize)
-           local k = 1
-           for i = t,math.min(t+opt.batchsize-1,input:size(1)) do
-              -- load new sample
-              inputs[k] = input[shuffle[i]]
-              targets[k] = target[shuffle[i]]
-              k = k+1
-           end
-           k=k-1
-           --in case the last batch is < batchsize
-           if k < opt.batchsize then
-             inputs = inputs:narrow(1, 1, k):clone()
-             targets = targets:narrow(1, 1, k):clone()
-           end
-           --zero out
-           model:zeroGradParameters()
-           --predict and compute loss
-           preds = model:forward(inputs)
-           loss = criterion:forward(preds, targets)
+            local inputs = torch.Tensor(opt.batchsize, input:size(2))
+            local targets = torch.Tensor(opt.batchsize)
+            local k = 1
+            for i = t,math.min(t+opt.batchsize-1,input:size(1)) do
+                -- load new sample
+                inputs[k] = input[shuffle[i]]
+                targets[k] = target[shuffle[i]]
+                k = k+1
+            end
+            k=k-1
+            --in case the last batch is < batchsize
+            if k < opt.batchsize then
+                inputs = inputs:narrow(1, 1, k):clone()
+                targets = targets:narrow(1, 1, k):clone()
+            end
+            --zero out
+            model:zeroGradParameters()
+            --predict and compute loss
+            preds = model:forward(inputs)
+            loss = criterion:forward(preds, targets)
 
-           -- Hack: the splitting layer must be removed before calling
-           -- backward or else nn will try to propagate some empty
-           -- gradients (since lookuptables have no gradients)
-           local splitLayer = model:get(1)
-           model:remove(1)
-           dLdpreds = criterion:backward(preds, targets)
-           model:backward(splitLayer:forward(inputs), dLdpreds)
-           model:updateParameters(opt.eta)
-           -- Add back
-           model:insert(splitLayer, 1)
+            -- Hack: the splitting layer must be removed before calling
+            -- backward or else nn will try to propagate some empty
+            -- gradients (since lookuptables have no gradients)
+            local splitLayer = model:get(1)
+            model:remove(1)
+            dLdpreds = criterion:backward(preds, targets)
+            model:backward(splitLayer:forward(inputs), dLdpreds)
+            model:updateParameters(opt.eta)
+            -- Add back
+            model:insert(splitLayer, 1)
 
-           epochLoss = epochLoss + loss
-           numBatches = numBatches + 1
+            epochLoss = epochLoss + loss
+            numBatches = numBatches + 1
         end
         --predicting accuracy of epoch
 
@@ -164,6 +176,40 @@ function memm(inputs, targets, valid, valid_target)
     return model
 end
 
+function memm2(inputs, targets, valid, valid_target)
+    -- using embeddings
+    local model = nn.Sequential()
+    model:add(nn.SplitTable(1, 1))
+
+    local parallel = nn.ParallelTable()
+    -- words features
+    local wordtable = nn.Sequential()
+    local wordlookup = nn.LookupTable(nfeatures, nembed)
+    if use_embedding > 0 then
+        wordlookup.weight:copy(embeddings)
+    end 
+    wordtable:add(wordlookup)
+    parallel:add(wordtable)
+
+    -- class features
+    local classtable = nn.Sequential()
+    local classlookup = nn.LookupTable(nclasses, nembed)
+    classtable:add(classlookup)
+    parallel:add(classtable)
+    model:add(parallel)
+    
+    -- Join over last dimension
+    model:add(nn.JoinTable(1, 1))
+    model:add(nn.Linear(nembed+nembed, nhidden))
+    model:add(nn.HardTanh())
+    model:add(nn.Linear(nhidden, nclasses))
+    model:add(nn.LogSoftMax())
+
+    criterion = nn.ClassNLLCriterion()
+    trainNN(model, criterion, inputs, targets, valid, valid_target)
+    return model
+end
+
 function score_memm(cur)
     local scores = torch.Tensor(nclasses, nclasses)
     for class=1, nclasses do
@@ -172,7 +218,6 @@ function score_memm(cur)
         scores:select(2, class):copy(res)
     end
     return scores
-
 end
 
 
@@ -181,6 +226,8 @@ function sperc(inputs, targets)
 end
 
 function viterbi(observations, logscore)
+    assert(observations[1][1] == startword)
+
     --Viterbi adjusted from the section notebook!
     local n = observations:size(1)
     local max_table = torch.Tensor(n, nclasses)
@@ -190,11 +237,13 @@ function viterbi(observations, logscore)
     -- the initial most likely paths are the initial state distribution
     -- NOTE: another unnecessary Tensor allocation here
     if opt.classifier == 'hmm' then
-        maxes, backpointers = (initial + emission[observations[1][1]]):max(2)
+        maxes = initial + emission[observations[1][1]]
     else
-        maxes, backpointers = logscore(observations[1]):max(2)
+        -- Force it to start at <s>, even though the NN should've figured this out
+        maxes = initial + logscore(observations[1]):max(2)
     end
     max_table[1] = maxes
+    -- backpointers are meaningless here
 
     -- remaining timesteps ("forwarding" the maxes)
     for i=2,n do
@@ -259,13 +308,14 @@ function sentenceFscore(inputs, targets, logscore)
     sentence_count = 0
     fscore_sum = 0
 
-    begin_index = 1
-    for index=2, inputs:size(1) do
+    begin_index = nil
+    for index=1, inputs:size(1) do
         -- Sentence delimeter
-        if inputs[index][1] == 2 then
-            current_prediction = viterbi(inputs:narrow(1, begin_index, index-begin_index), logscore)
-            current_fscore = fscore(current_prediction, targets:narrow(1, begin_index, index-begin_index):squeeze())
+        if inputs[index][1] == startword then
             begin_index = index
+        elseif begin_index and inputs[index][1] == endword then
+            current_prediction = viterbi(inputs:narrow(1, begin_index, index-begin_index+1), logscore)
+            current_fscore = fscore(current_prediction, targets:narrow(1, begin_index, index-begin_index+1):squeeze())
             sentence_count = sentence_count + 1
             fscore_sum = fscore_sum + current_fscore
         end
@@ -274,14 +324,69 @@ function sentenceFscore(inputs, targets, logscore)
 end
 
 
+function print_pred_labels(f, inputs, logscore)
+    f:write("ID,Labels\n")
+
+    begin_index = nil
+    curind = 1
+    for index=1, inputs:size(1) do
+        -- Sentence delimeter
+        if inputs[index][1] == startword then
+            begin_index = index
+        elseif begin_index and inputs[index][1] == endword then
+            prediction = viterbi(inputs:narrow(1, begin_index, index-begin_index+1), logscore)
+
+            f:write(curind, ",")
+            prev = false
+            prevsuff = nil
+            for i = 1, prediction:size(1) do
+                cur = prediction[i]
+                if cur > 1 and cur < initclass then
+                    str = label_map[cur]
+                    suff = str:sub(3)
+                    if prevsuff and prevsuff == suff and str:sub(1, 1) == "I" then
+                        f:write("-", i-1)
+                    else
+                        if prev then
+                            f:write(" ")
+                        end
+                        f:write(suff, "-", i-1)
+                    end
+                    prevsuff = suff
+                    prev = true
+                else
+                    prevsuff = nil
+                end
+            end
+            curind = curind + 1
+            f:write("\n")
+        end
+    end
+end
+
+
 function main()
     -- Parse input params
     opt = cmd:parse(arg)
     local f = hdf5.open(opt.datafile, 'r')
+    classifier = opt.classifier
+    outfile = opt.outfile
+
     nclasses = f:read('nclasses'):all():long()[1]
     nfeatures = f:read('nfeatures'):all():long()[1]
-    -- First real class assumed here
-    initclass = nclasses - 1
+
+    nembed = opt.nembed
+    nhidden = opt.nhidden
+    use_embedding = opt.use_embedding
+
+    -- This is the first word
+    startword = 2
+    endword = 3
+    -- This is the tag for <s>
+    initclass = 8
+    initial = torch.Tensor(nclasses,1):fill(0)
+    initial[initclass] = 1.0
+    initial:log()
 
     print("nfeatures", nfeatures)
     print("nclasses", nclasses)
@@ -298,6 +403,7 @@ function main()
     test_input = f:read('test_input'):all():long()
     -- For consistency
     test_input = reshapeTrainingData(test_input, nil)
+
     embeddings = f:read('embeddings'):all()
 
     print("train size", train_input:size())
@@ -309,21 +415,35 @@ function main()
     assert(fscore(test_tensor, test_tensor), 10)
 
     -- Train.
-    if opt.classifier == 'hmm' then
-        initial, emission, transition = hmm(train_input, train_target)
+    if classifier == 'hmm' then
+        emission, transition = hmm(train_input, train_target)
         -- print(viterbi(valid_input:narrow(1,1,15), score_hmm))
         -- print(valid_target:narrow(1,1,15))
         -- first15score = fscore(viterbi(valid_input:narrow(1,1,15), score_hmm), valid_target:narrow(1,1,15))
         -- print(first15score)
         print ("Average Training F-Score is " .. sentenceFscore(train_input, train_target, score_hmm))
         print ("Average Validation F-Score is " .. sentenceFscore(valid_input, valid_target, score_hmm))
-    elseif opt.classifier == 'memm' then
+    elseif classifier == 'memm' then
         model = memm(train_input, train_target, valid_input, valid_target)
         print ("Average Training F-Score is " .. sentenceFscore(train_input, train_target, score_memm))
         print ("Average Validation F-Score is " .. sentenceFscore(valid_input, valid_target, score_memm))
-
+    elseif classifier == 'memm2' then
+        model = memm2(train_input, train_target, valid_input, valid_target)
+        print ("Average Training F-Score is " .. sentenceFscore(train_input, train_target, score_memm))
+        print ("Average Validation F-Score is " .. sentenceFscore(valid_input, valid_target, score_memm))
     end
+
     -- Test.
+    if outfile and outfile:len() > 0 then
+        print("Writing to", outfile)
+        local f_preds = io.open(outfile, "w")
+        local fn = score_hmm
+        if classifier ~= "hmm" then
+            fn = score_memm
+        end
+        print_pred_labels(f_preds, test_input, fn)
+    end
+    print("Done!")
 end
 
 main()

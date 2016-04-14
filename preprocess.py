@@ -26,7 +26,7 @@ def generate_bio2id(filename):
             k,v =line.split()
             bio2id[k] = int(v)
     bio2id['<t>'] = max(bio2id.values())+1
-    bio2id['</t>'] = max(bio2id.values())+2
+    bio2id['</t>'] = max(bio2id.values())+1
     return bio2id
 
 def get_embeddings():
@@ -61,7 +61,8 @@ def get_vocab(filelist, embeddings):
                         word2idx[cword] = idx
                         idx_to_embedding.append(embeddings[cword])
                         idx += 1
-    print(idx, "words have been counted")
+    print(len(word2idx), "words have been counted")
+    print(len(idx_to_embedding))
     return word2idx, np.array(idx_to_embedding, dtype=np.float32)
 
 
