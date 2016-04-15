@@ -344,7 +344,7 @@ function trainNNViterbi(model, input, target, vinput, vtarget)
     end
 
     if opt.use_averaging > 0 then
-        print("total count", totalcnt)
+        print("averaging over", totalcnt)
         params:copy(totalparams / totalcnt)
     end
 end
