@@ -14,11 +14,13 @@ cmd:option('-outfile', '', 'output file')
 cmd:option('-beta', 1, 'beta for F-Score')
 cmd:option('-laplace', 1, 'added counts for laplace smoothing')
 cmd:option('-batchsize', 16, 'Batches to train at once')
-cmd:option('-eta', 0.0005, 'Training eta')
+cmd:option('-eta', 0.001, 'Training eta')
 cmd:option('-epochs', 40, 'Epochs to train for')
 cmd:option('-nembed', 50, 'Embedding layer')
 cmd:option('-nhidden', 100, 'Hidden layer')
 cmd:option('-use_embedding', 1, 'Use embedding')
+cmd:option('-use_aux', 1, 'Use auxillary features')
+cmd:option('-use_structured', 0, 'Use structured perceptron')
 
 label_map = {
     [2] = "I-PER",
@@ -32,11 +34,11 @@ label_map = {
 -- ...
 function hmm(inputs, targets)
     local transition = torch.Tensor(nclasses, nclasses):fill(opt.laplace)
-    local emission = torch.Tensor(nfeatures, nclasses):fill(opt.laplace)
+    local emission = torch.Tensor(nwords, nclasses):fill(opt.laplace)
 
     --train transition and emission
     local statecount = torch.Tensor(nclasses, nclasses):fill(opt.laplace*nclasses)
-    local emissioncount = torch.Tensor(nclasses, nfeatures):fill(opt.laplace*nfeatures)
+    local emissioncount = torch.Tensor(nclasses, nwords):fill(opt.laplace*nwords)
     local prevstate = targets[1]
     for i=1, targets:size(1) do
         --count transitions
@@ -54,79 +56,74 @@ function hmm(inputs, targets)
     return emission:log(), transition:log()
 end
 
+
 function score_hmm(cur)
     local observation_emission = emission[cur[1]]:view(nclasses, 1):expand(nclasses, nclasses)
     -- NOTE: allocates a new Tensor
     return observation_emission + transition
 end
 
+
 function reshapeTrainingData(inputs, targets)
     if targets then
-        newInput = torch.Tensor(inputs:size(1)-1, 2):long():fill(0)
-        newInput:narrow(2,1,1):copy(inputs:narrow(1,2,inputs:size(1)-1))
-
-        newInput:narrow(2,2,1):copy(targets:narrow(1,1,inputs:size(1)-1))
-
-        newTargets = torch.Tensor(inputs:size(1)-1):long()
-        newTargets:copy(targets:narrow(1,2,inputs:size(1)-1))
+        newInput = torch.cat(
+            inputs:narrow(1, 2, inputs:size(1)-1),
+            targets:narrow(1, 1, inputs:size(1)-1):view(inputs:size(1)-1, 1)
+        )
+        newTargets = targets:narrow(1, 2, inputs:size(1)-1):clone()
     else
-        newInput = torch.Tensor(inputs:size(1), 2):long():fill(0)
-        newInput:narrow(2,1,1):copy(inputs)
+        newInput = torch.cat(inputs, torch.Tensor(inputs:size(1), 1):fill(0))
     end
 
     return newInput, newTargets
 end
 
+
 function trainNN(model, criterion, input, target, vinput, vtarget)
     print(input:size(1), "size of the test set")
-    --SGD after torch nn tutorial and https://github.com/torch/tutorials/blob/master/2_supervised/4_train.lua
-    for i=1, opt.epochs do
+    -- SGD after torch nn tutorial and https://github.com/torch/tutorials/blob/master/2_supervised/4_train.lua
+    for iter = 1, opt.epochs do
         epochLoss = 0
-        numBatches = 0
-        --shuffle data
+        -- shuffle data
         shuffle = torch.randperm(input:size(1))
-        --mini batches, yay
+        -- mini batches, yay
         for t=1, input:size(1), opt.batchsize do
             xlua.progress(t, input:size(1))
 
             local inputs = torch.Tensor(opt.batchsize, input:size(2))
             local targets = torch.Tensor(opt.batchsize)
             local k = 1
-            for i = t,math.min(t+opt.batchsize-1,input:size(1)) do
+            for i = t, math.min(t+opt.batchsize-1,input:size(1)) do
                 -- load new sample
                 inputs[k] = input[shuffle[i]]
                 targets[k] = target[shuffle[i]]
                 k = k+1
             end
-            k=k-1
-            --in case the last batch is < batchsize
+            k = k-1
+            -- in case the last batch is < batchsize
             if k < opt.batchsize then
                 inputs = inputs:narrow(1, 1, k):clone()
                 targets = targets:narrow(1, 1, k):clone()
             end
-            --zero out
+            -- zero out
             model:zeroGradParameters()
-            --predict and compute loss
+            -- predict and compute loss
             preds = model:forward(inputs)
             loss = criterion:forward(preds, targets)
 
-            -- Hack: the splitting layer must be removed before calling
-            -- backward or else nn will try to propagate some empty
-            -- gradients (since lookuptables have no gradients)
-            local splitLayer = model:get(1)
-            model:remove(1)
             dLdpreds = criterion:backward(preds, targets)
-            model:backward(splitLayer:forward(inputs), dLdpreds)
+            -- Hack: remove concat layer and then add it back, since LookupTable doesn't return valid gradients
+            local concatLayer = model:get(1)
+            model:remove(1)
+            model:backward(concatLayer:forward(inputs), dLdpreds)
             model:updateParameters(opt.eta)
-            -- Add back
-            model:insert(splitLayer, 1)
+            model:insert(concatLayer, 1)
 
             epochLoss = epochLoss + loss
-            numBatches = numBatches + 1
         end
-        --predicting accuracy of epoch
+        -- predicting accuracy of epoch
 
-        print("\nepoch " .. i .. ", loss: " .. epochLoss/numBatches/opt.batchsize)
+        print("\nepoch " .. iter .. ", loss: " .. epochLoss / input:size(1))
 
         _, yhat = model:forward(input):max(2)
         validationFScore = fscore(yhat:squeeze(), target:squeeze())
@@ -135,112 +132,121 @@ function trainNN(model, criterion, input, target, vinput, vtarget)
         _, yhat = model:forward(vinput):max(2)
         validationFScore = fscore(yhat:squeeze(), vtarget:squeeze())
         print(validationFScore, "FScore on whole Validation set")
-
     end
     return model
 end
 
-function memm(inputs, targets, valid, valid_target)
-    --no using embeddings at this point!
+
+function memm(inputs)
+    -- no using embeddings at this point!
     local model = nn.Sequential()
-    model:add(nn.SplitTable(1, 1))
+
+    local concat = nn.ConcatTable()
+    concat:add(nn.Select(2, 1))
+    local naux = inputs:size(2)-2
+    if use_aux > 0 then
+        concat:add(nn.Narrow(2, 2, naux))
+    end
+    concat:add(nn.Select(2, inputs:size(2)))
+    model:add(concat)
 
     local parallel = nn.ParallelTable()
-
     -- words features
-    local wordtable = nn.Sequential()
-    -- Sparse feaure logistic regression
-    local wordlookup = nn.LookupTable(nfeatures, nclasses)
-    wordtable:add(wordlookup)
-    parallel:add(wordtable)
-
+    local wordlookup = nn.LookupTable(nwords, nclasses)
+    parallel:add(wordlookup)
+    -- aux features
+    if use_aux > 0 then
+        parallel:add(nn.Linear(naux, nclasses))
+    end
     -- prev class features
-    local classtable = nn.Sequential()
-    -- Sparse feature logistic regression
     local classlookup = nn.LookupTable(nclasses, nclasses)
-    classtable:add(classlookup)
-    parallel:add(classtable)
-
+    parallel:add(classlookup)
     model:add(parallel)
     
-    -- Join over last dimension
+    -- Sum over the 3 concatenated tables (linear model)
     model:add(nn.JoinTable(1, 1))
-    -- Sum over the joined tables (linear model)
-    model:add(nn.View(2, nclasses))
+    model:add(nn.View(2+use_aux, nclasses))
     model:add(nn.Sum(1, 2))
-
-    model:add(nn.LogSoftMax())
-
-    criterion = nn.ClassNLLCriterion()
-    trainNN(model, criterion, inputs, targets, valid, valid_target)
     return model
 end
 
-function memm2(inputs, targets, valid, valid_target)
+
+function memm2(inputs)
     -- using embeddings
     local model = nn.Sequential()
-    model:add(nn.SplitTable(1, 1))
+
+    local concat = nn.ConcatTable()
+    concat:add(nn.Select(2, 1))
+    local naux = inputs:size(2)-2
+    if use_aux > 0 then
+        concat:add(nn.Narrow(2, 2, naux))
+    end
+    concat:add(nn.Select(2, inputs:size(2)))
+    model:add(concat)
 
     local parallel = nn.ParallelTable()
     -- words features
-    local wordtable = nn.Sequential()
-    local wordlookup = nn.LookupTable(nfeatures, nembed)
+    local wordlookup = nn.LookupTable(nwords, nembed)
     if use_embedding > 0 then
         wordlookup.weight:copy(embeddings)
     end 
-    wordtable:add(wordlookup)
-    parallel:add(wordtable)
-
-    -- class features
-    local classtable = nn.Sequential()
+    parallel:add(wordlookup)
+    -- aux features
+    if use_aux > 0 then
+        parallel:add(nn.Identity())
+    end
+    -- prev class features
     local classlookup = nn.LookupTable(nclasses, nembed)
-    classtable:add(classlookup)
-    parallel:add(classtable)
+    parallel:add(classlookup)
     model:add(parallel)
     
-    -- Join over last dimension
+    -- Linear model over the concatenated features
     model:add(nn.JoinTable(1, 1))
-    model:add(nn.Linear(nembed+nembed, nhidden))
+    model:add(nn.Linear(nembed + naux*use_aux + nembed, nhidden))
     model:add(nn.HardTanh())
     model:add(nn.Linear(nhidden, nclasses))
+    return model
+end
+
+
+function trainNNClassifier(model_fn, inputs, targets, valid, valid_target)
+    local model = model_fn(inputs)
     model:add(nn.LogSoftMax())
 
-    criterion = nn.ClassNLLCriterion()
+    criterion = nn.ClassNLLCriterion(nil, false)
     trainNN(model, criterion, inputs, targets, valid, valid_target)
     return model
 end
 
-function score_memm(cur)
+
+function score_memm(model, cur)
+    cur = cur:clone()
     local scores = torch.Tensor(nclasses, nclasses)
     for class=1, nclasses do
-        cur[2] = class
-        local res = model:forward(torch.Tensor(1, 2):copy(cur))
+        cur[cur:size(1)] = class
+        local res = model:forward(cur:view(1, cur:size(1)))
         scores:select(2, class):copy(res)
     end
     return scores
 end
 
 
-function sperc(inputs, targets)
-
-end
-
-function viterbi(observations, logscore)
+function viterbi(observations, score_fn)
+    local n = observations:size(1)
     assert(observations[1][1] == startword)
+    assert(observations[n][1] == endword)
 
     --Viterbi adjusted from the section notebook!
-    local n = observations:size(1)
     local max_table = torch.Tensor(n, nclasses)
     local backpointer_table = torch.Tensor(n, nclasses)
 
     -- first timestep
     -- the initial most likely paths are the initial state distribution
-    -- NOTE: another unnecessary Tensor allocation here
     if opt.classifier == 'hmm' then
         maxes = initial + emission[observations[1][1]]
     else
-        -- Force it to start at <s>, even though the NN should've figured this out
-        maxes = initial + logscore(observations[1]):max(2)
+        -- Force first tag to be start tag
+        maxes = initial + score_fn(observations[1]):max(2)
     end
     max_table[1] = maxes
     -- backpointers are meaningless here
@@ -248,10 +254,10 @@ function viterbi(observations, logscore)
     -- remaining timesteps ("forwarding" the maxes)
     for i=2,n do
         -- precompute edge scores
-        y = logscore(observations[i])
+        y = score_fn(observations[i])
         scores = y + maxes:view(1, nclasses):expand(nclasses, nclasses)
 
-        -- compute new maxes (NOTE: another unnecessary Tensor allocation here)
+        -- compute new maxes
         maxes, backpointers = scores:max(2)
 
         -- record
@@ -261,13 +267,86 @@ function viterbi(observations, logscore)
 
     -- follow backpointers to recover max path
     local classes = torch.Tensor(n)
-    maxes, classes[n] = maxes:max(1)
-    for i=n,2,-1 do
+    -- Force last tag to be end tag
+    classes[n] = endclass
+    for i=n, 2, -1 do
         classes[i-1] = backpointer_table[i][classes[i]]
     end
-
     return classes
 end
+
+
+function trainNNViterbi(model, input, target, vinput, vtarget)
+    print(input:size(1), "size of the test set")
+    local score_fn = function(cur) return score_memm(model, cur) end
+    local params, gradParams = model:getParameters()
+    for iter = 1, opt.epochs do
+        epochLoss = 0
+
+        begin_index = nil
+        for index = 1, input:size(1) do
+            -- Sentence delimiter
+            if input[index][1] == startword then
+                begin_index = index
+            elseif begin_index and input[index][1] == endword then
+                xlua.progress(index, input:size(1))
+
+                inputs = input:narrow(1, begin_index, index-begin_index+1):clone()
+                targets = target:narrow(1, begin_index, index-begin_index+1):clone()
+                prediction = viterbi(inputs, score_fn)
+
+                -- Hack: remove concat layer and then add it back, since LookupTable doesn't return valid gradients
+                local concatLayer = model:get(1)
+                model:remove(1)
+                -- zero out
+                model:zeroGradParameters()
+                -- Iterate through, tracking prev predicted class
+                local prevclass = startclass
+                for i = 1, inputs:size(1) do
+                    if prediction[i] ~= targets[i] then
+                        local cur = inputs[i]:clone()
+                        cur[cur:size(1)] = prevclass
+                        -- Pass through first layer manually
+                        local table = concatLayer:forward(cur:view(1, cur:size(1)))
+
+                        local preds = model:forward(table)
+                        -- Manually compute gradients
+                        local dLdpreds = torch.Tensor(1, nclasses):zero()
+                        dLdpreds[1][targets[i]] = -1
+                        dLdpreds[1][prediction[i]] = 1
+                        model:backward(table, dLdpreds)
+
+                        local m = gradParams:abs():max()
+                        if m ~= m or m > 1e9 then
+                            print("Fail")
+                            os.exit(10)
+                        end
+                    end
+                    prevclass = prediction[i]
+                end
+                model:updateParameters(opt.eta)
+                model:insert(concatLayer, 1)
+            end
+        end
+
+        _, yhat = model:forward(input):max(2)
+        validationFScore = fscore(yhat:squeeze(), target:squeeze())
+        print(validationFScore, "FScore on whole Training set")
+
+        _, yhat = model:forward(vinput):max(2)
+        validationFScore = fscore(yhat:squeeze(), vtarget:squeeze())
+        print(validationFScore, "FScore on whole Validation set")
+    end
+end
+
+
+function trainNNStructured(model_fn, inputs, targets, valid, valid_target)
+    local model = model_fn(inputs)
+
+    trainNNViterbi(model, inputs, targets, valid, valid_target)
+    return model
+end
+
 
 function fscore(yhat, y)
     --fscore for one-dimensional vector
@@ -277,14 +356,14 @@ function fscore(yhat, y)
     local recallcnt = 0
     for i=1, yhat:size(1) do
         --true predictions
-        if yhat[i] > 1 and yhat[i] < initclass then
+        if yhat[i] > 1 and yhat[i] < startclass then
             if y[i] == yhat[i] then
                 precision = precision + 1
             end
             precisioncnt = precisioncnt + 1
         end
         -- of targets, how many were predicted
-        if y[i] > 1 and y[i] < initclass then
+        if y[i] > 1 and y[i] < startclass then
             if y[i] == yhat[i] then
                 recall = recall + 1
             end
@@ -310,7 +389,7 @@ function sentenceFscore(inputs, targets, logscore)
 
     begin_index = nil
     for index=1, inputs:size(1) do
-        -- Sentence delimeter
+        -- Sentence delimiter
         if inputs[index][1] == startword then
             begin_index = index
         elseif begin_index and inputs[index][1] == endword then
@@ -330,7 +409,7 @@ function print_pred_labels(f, inputs, logscore)
     begin_index = nil
     curind = 1
     for index=1, inputs:size(1) do
-        -- Sentence delimeter
+        -- Sentence delimiter
         if inputs[index][1] == startword then
             begin_index = index
         elseif begin_index and inputs[index][1] == endword then
@@ -341,7 +420,7 @@ function print_pred_labels(f, inputs, logscore)
             prevsuff = nil
             for i = 1, prediction:size(1) do
                 cur = prediction[i]
-                if cur > 1 and cur < initclass then
+                if cur > 1 and cur < startclass then
                     str = label_map[cur]
                     suff = str:sub(3)
                     if prevsuff and prevsuff == suff and str:sub(1, 1) == "I" then
@@ -373,34 +452,42 @@ function main()
     outfile = opt.outfile
 
     nclasses = f:read('nclasses'):all():long()[1]
-    nfeatures = f:read('nfeatures'):all():long()[1]
+    nwords = f:read('nwords'):all():long()[1]
 
     nembed = opt.nembed
     nhidden = opt.nhidden
     use_embedding = opt.use_embedding
+    use_aux = opt.use_aux
+    use_structured = opt.use_structured
 
     -- This is the first word
     startword = 2
     endword = 3
     -- This is the tag for <s>
-    initclass = 8
-    initial = torch.Tensor(nclasses,1):fill(0)
-    initial[initclass] = 1.0
+    startclass = 8
+    -- This is the tag for </s>
+    endclass = 9
+    -- Initial state for HMM
+    initial = torch.Tensor(nclasses, 1):fill(0)
+    initial[startclass] = 1.0
     initial:log()
 
-    print("nfeatures", nfeatures)
+    print("nwords", nwords)
     print("nclasses", nclasses)
-    print("initclass", initclass)
+    print("startclass", startclass)
+    print("endclass", endclass)
 
-    train_input = f:read('train_input'):all():long()
-    train_target = f:read('train_output'):all():long()
+    train_input = f:read('train_input'):all():double()
+    nfeatures = train_input:size(2)
+    print("nfeatures", nfeatures)
+    train_target = f:read('train_output'):all():double()
     train_input, train_target = reshapeTrainingData(train_input, train_target)
 
-    valid_input = f:read('valid_input'):all():long()
-    valid_target = f:read('valid_output'):all():long()
+    valid_input = f:read('valid_input'):all():double()
+    valid_target = f:read('valid_output'):all():double()
     valid_input, valid_target = reshapeTrainingData(valid_input, valid_target)
 
-    test_input = f:read('test_input'):all():long()
+    test_input = f:read('test_input'):all():double()
     -- For consistency
     test_input = reshapeTrainingData(test_input, nil)
 
@@ -415,33 +502,32 @@ function main()
     assert(fscore(test_tensor, test_tensor), 10)
 
     -- Train.
+    local score_fn = nil
     if classifier == 'hmm' then
         emission, transition = hmm(train_input, train_target)
-        -- print(viterbi(valid_input:narrow(1,1,15), score_hmm))
-        -- print(valid_target:narrow(1,1,15))
-        -- first15score = fscore(viterbi(valid_input:narrow(1,1,15), score_hmm), valid_target:narrow(1,1,15))
-        -- print(first15score)
-        print ("Average Training F-Score is " .. sentenceFscore(train_input, train_target, score_hmm))
-        print ("Average Validation F-Score is " .. sentenceFscore(valid_input, valid_target, score_hmm))
-    elseif classifier == 'memm' then
-        model = memm(train_input, train_target, valid_input, valid_target)
-        print ("Average Training F-Score is " .. sentenceFscore(train_input, train_target, score_memm))
-        print ("Average Validation F-Score is " .. sentenceFscore(valid_input, valid_target, score_memm))
-    elseif classifier == 'memm2' then
-        model = memm2(train_input, train_target, valid_input, valid_target)
-        print ("Average Training F-Score is " .. sentenceFscore(train_input, train_target, score_memm))
-        print ("Average Validation F-Score is " .. sentenceFscore(valid_input, valid_target, score_memm))
+        score_fn = score_hmm
+    else
+        local model_fn = nil
+        if classifier == 'memm' then
+            model_fn = memm
+        elseif classifier == 'memm2' then
+            model_fn = memm2
+        end
+        if use_structured > 0 then
+            model = trainNNStructured(model_fn, train_input, train_target, valid_input, valid_target)
+        else
+            model = trainNNClassifier(model_fn, train_input, train_target, valid_input, valid_target)
+        end
+        score_fn = function(cur) return score_memm(model, cur) end
     end
+    print("Average Training F-Score is " .. sentenceFscore(train_input, train_target, score_fn))
+    print("Average Validation F-Score is " .. sentenceFscore(valid_input, valid_target, score_fn))
 
     -- Test.
     if outfile and outfile:len() > 0 then
         print("Writing to", outfile)
         local f_preds = io.open(outfile, "w")
-        local fn = score_hmm
-        if classifier ~= "hmm" then
-            fn = score_memm
-        end
-        print_pred_labels(f_preds, test_input, fn)
+        print_pred_labels(f_preds, test_input, score_fn)
     end
     print("Done!")
 end
