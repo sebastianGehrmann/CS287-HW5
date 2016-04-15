@@ -14,13 +14,14 @@ cmd:option('-outfile', '', 'output file')
 cmd:option('-beta', 1, 'beta for F-Score')
 cmd:option('-laplace', 1, 'added counts for laplace smoothing')
 cmd:option('-batchsize', 16, 'Batches to train at once')
-cmd:option('-eta', 0.001, 'Training eta')
+cmd:option('-eta', 0.0005, 'Training eta')
 cmd:option('-epochs', 40, 'Epochs to train for')
 cmd:option('-nembed', 50, 'Embedding layer')
 cmd:option('-nhidden', 100, 'Hidden layer')
 cmd:option('-use_embedding', 1, 'Use embedding')
 cmd:option('-use_aux', 1, 'Use auxillary features')
 cmd:option('-use_structured', 0, 'Use structured perceptron')
+cmd:option('-use_averaging', 1, 'Use averaging in structured perceptron')
 
 label_map = {
     [2] = "I-PER",
@@ -80,7 +81,9 @@ end
 
 
 function trainNN(model, criterion, input, target, vinput, vtarget)
-    print(input:size(1), "size of the test set")
+    print("input size", #input)
+    print("eta", opt.eta)
+    print("epochs", opt.epochs)
     -- SGD after torch nn tutorial and https://github.com/torch/tutorials/blob/master/2_supervised/4_train.lua
     for iter = 1, opt.epochs do
         epochLoss = 0
@@ -277,9 +280,14 @@ end
 
 
 function trainNNViterbi(model, input, target, vinput, vtarget)
-    print(input:size(1), "size of the test set")
+    print("input size", #input)
+    print("eta", opt.eta)
+    print("epochs", opt.epochs)
     local score_fn = function(cur) return score_memm(model, cur) end
     local params, gradParams = model:getParameters()
+    -- params:zero()
+    local totalparams = torch.Tensor(params:size()):zero()
+    local totalcnt = 0
     for iter = 1, opt.epochs do
         epochLoss = 0
 
@@ -315,17 +323,14 @@ function trainNNViterbi(model, input, target, vinput, vtarget)
                         dLdpreds[1][targets[i]] = -1
                         dLdpreds[1][prediction[i]] = 1
                         model:backward(table, dLdpreds)
-
-                        local m = gradParams:abs():max()
-                        if m ~= m or m > 1e9 then
-                            print("Fail")
-                            os.exit(10)
-                        end
                     end
                     prevclass = prediction[i]
                 end
                 model:updateParameters(opt.eta)
                 model:insert(concatLayer, 1)
+
+                totalparams = totalparams + params
+                totalcnt = totalcnt + 1
             end
         end
 
@@ -336,6 +341,11 @@ function trainNNViterbi(model, input, target, vinput, vtarget)
         _, yhat = model:forward(vinput):max(2)
         validationFScore = fscore(yhat:squeeze(), vtarget:squeeze())
         print(validationFScore, "FScore on whole Validation set")
+    end
+
+    if opt.use_averaging > 0 then
+        print("total count", totalcnt)
+        params:copy(totalparams / totalcnt)
     end
 end
 
@@ -493,9 +503,9 @@ function main()
 
     embeddings = f:read('embeddings'):all()
 
-    print("train size", train_input:size())
-    print("valid size", valid_input:size())
-    print("test size", test_input:size())
+    print("train size", #train_input)
+    print("valid size", #valid_input)
+    print("test size", #test_input)
 
     --test the f-score function
     test_tensor = torch.Tensor(10):fill(2)
