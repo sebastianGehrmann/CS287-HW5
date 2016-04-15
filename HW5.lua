@@ -285,7 +285,7 @@ function trainNNViterbi(model, input, target, vinput, vtarget)
     print("epochs", opt.epochs)
     local score_fn = function(cur) return score_memm(model, cur) end
     local params, gradParams = model:getParameters()
-    -- params:zero()
+    params:zero()
     local totalparams = torch.Tensor(params:size()):zero()
     local totalcnt = 0
     for iter = 1, opt.epochs do
