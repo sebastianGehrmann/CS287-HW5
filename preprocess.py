@@ -11,6 +11,7 @@ import re
 import codecs
 import gzip
 import collections
+import struct
 
 # Your preprocessing, features construction, and word2vec code.
 
@@ -20,15 +21,22 @@ def transform_word(word):
     #lw = re.sub('\d+', 'NUMBER', lw)
     return lw
 
+
+bio2id = {}
+
 def generate_bio2id(filename):
-    bio2id = {}
     with open(filename, 'r') as f:
         for line in f:
-            k,v =line.split()
+            k, v = line.split()
+            if k.startswith("B"):
+                continue
             bio2id[k] = int(v)
     bio2id['<t>'] = max(bio2id.values())+1
     bio2id['</t>'] = max(bio2id.values())+1
     return bio2id
+
+
+word2idx = {}
 
 def get_embeddings():
     embeddings = {}
@@ -39,7 +47,6 @@ def get_embeddings():
     return embeddings
 
 def get_vocab(filelist, embeddings):
-    word2idx = {}
     idx_to_embedding = []
     idx_to_embedding.append(np.random.randn(50))
     idx_to_embedding.append(np.random.randn(50))
@@ -49,6 +56,7 @@ def get_vocab(filelist, embeddings):
     word2idx["<s>"] = 2
     word2idx["</s>"] = 3
     idx=4
+    missing = collections.Counter()
     for filename in filelist:
         with open(filename, 'r') as f:
             for line in f:
@@ -58,36 +66,53 @@ def get_vocab(filelist, embeddings):
                 if cword:
                     cword = cword[2]
                     cword = transform_word(cword)
-                    if cword not in word2idx and cword in embeddings:
-                        word2idx[cword] = idx
-                        idx_to_embedding.append(embeddings[cword])
-                        idx += 1
-    print(len(word2idx), "words have been counted")
-    print(len(idx_to_embedding))
-    return word2idx, np.array(idx_to_embedding, dtype=np.float32)
+                    if cword not in word2idx:
+                        if cword in embeddings:
+                            word2idx[cword] = idx
+                            idx_to_embedding.append(embeddings[cword])
+                            idx += 1
+                        else:
+                            missing[cword] += 1
+    print len(word2idx), "words have been counted"
+    print len(missing), "unknown words"
+    print missing.most_common(100)
+    print len(idx_to_embedding)
+    return np.array(idx_to_embedding, dtype=np.float32)
+
 
 ngrams = []
+cities = collections.defaultdict(float)
+cities2 = collections.defaultdict(float)
+countries = collections.defaultdict(float)
+names = collections.defaultdict(float)
+firstmale = collections.defaultdict(float)
+firstfemale = collections.defaultdict(float)
+last = collections.defaultdict(float)
 
-def get_features(word):
-    res = []
-    res.append(len(word))
-    for i in xrange(ord('0'), ord('9')+1):
-        res.append(word.count(chr(i)))
-    for i in xrange(ord('a'), ord('z')+1):
-        res.append(word.count(chr(i)))
-    for i in xrange(ord('A'), ord('Z')+1):
-        res.append(word.count(chr(i)))
-    for c in ',.():;-\'\"</':
-        res.append(word.count(c))
-    for i in xrange(5):
-        res.append(word[i].isupper() if len(word) > i else 0)
-    for i in xrange(5):
-        res.append(word[i].islower() if len(word) > i else 0)
-    # word = re.sub(r'[^a-z]+', '', word.lower())
-    # for grams in ngrams:
-    #     for w in grams:
-    #         res.append(word.count(w))
-    return res
+
+def read_csv(filename, out, delim, col, ncol=None, fn=None, encoding='utf8'):
+    with codecs.open(filename, 'r', encoding) as f:
+        for line in f:
+            line = re.sub(r'".*?"', '""', line)
+            cline = filter(None, line.split(delim))
+            if len(cline) > col:
+                word = cline[col]
+                word = re.sub(r'[^a-z]+', '', word.lower())
+                if word:
+                    num = fn(cline[ncol]) if ncol else 1
+                    out[word] += num
+    print filename, len(out), "entries"
+
+
+def read_json(filename, out, encoding='utf8'):
+    with codecs.open(filename, 'r', encoding) as f:
+        for line in f:
+            cline = filter(None, re.split(r'[:",\]\[{}]+', line))
+            for word in cline:
+                word = re.sub(r'[^a-z]+', '', word.lower())
+                if word:
+                    out[word] += 1
+    print filename, len(out), "entries"
 
 
 def count_ngrams(filename):
@@ -108,73 +133,110 @@ def count_ngrams(filename):
         print ngrams[i]
 
 
-def convert_data(filename, word2idx, bio2id):
+def get_features(word, window):
+    res = []
+    res.append(word2idx.get(transform_word(word), word2idx["<unk>"]))
+    for oth in window:
+        res.append(word2idx.get(transform_word(oth), word2idx["<unk>"]))
+
+    res.append(len(word))
+    for i in xrange(ord('0'), ord('9')+1):
+        res.append(word.count(chr(i)))
+    for c in ',.():;-\'\"</':
+        res.append(word.count(c))
+    for i in xrange(ord('a'), ord('z')+1):
+        res.append(word.count(chr(i)))
+    for i in xrange(ord('A'), ord('Z')+1):
+        res.append(word.count(chr(i)))
+    for i in xrange(5):
+        res.append(word[i].isupper() if len(word) > i else 0)
+    for i in xrange(5):
+        res.append(word[i].islower() if len(word) > i else 0)
+    for oth in window:
+        res.append(len(oth))
+        for i in xrange(2):
+            res.append(oth[i].isupper() if len(oth) > i else 0)
+        for i in xrange(2):
+            res.append(oth[i].islower() if len(oth) > i else 0)
+
+    word = re.sub(r'[^a-z]+', '', word.lower())
+
+    res.append(word in cities)
+    res.append(word in cities2)
+    res.append(word in countries)
+    res.append(word in names)
+    res.append(word in firstmale)
+    res.append(word in firstfemale)
+    res.append(word in last)
+
+    res.append(cities.get(word, 0))
+    res.append(cities2.get(word, 0))
+    res.append(countries.get(word, 0))
+    res.append(names.get(word, 0))
+    res.append(firstmale.get(word, 0))
+    res.append(firstfemale.get(word, 0))
+    res.append(last.get(word, 0))
+    # for grams in ngrams:
+    #     for w in grams:
+    #         res.append(word.count(w))
+    return res
+
+# window on each side
+WINDOW = 3
+
+def get_all_features(words):
+    features = []
+    padded_words = ["<s>"] * WINDOW + words + ["</s>"] * WINDOW
+    for i in xrange(len(words)):
+        prev = padded_words[i: i + WINDOW]
+        nxt = padded_words[i + WINDOW + 1: i + WINDOW * 2 + 1]
+        features.append(get_features(words[i], prev + nxt))
+    npfeatures = np.array(features, dtype=np.float32)
+    return npfeatures
+
+def convert_data(filename):
     #start tags
-    inputs = [word2idx['<s>']]
-    features = [get_features('<s>')]
+    words = ["<s>"]
     targets = [bio2id['<t>']]
     with open(filename, 'r') as f:
         for line in f:
             cline = line.split()
             if cline:
                 word = cline[2]
-                #transformation still very basic!
-                cword = transform_word(word)
                 ctag = cline[3]
-                if cword in word2idx:
-                    inputs.append(word2idx[cword])
-                else:
-                    inputs.append(word2idx["<unk>"])
-                features.append(get_features(word))
+                words.append(word)
+                if ctag.startswith("B"):
+                    ctag = "I" + ctag[1:]
                 targets.append(bio2id[ctag])
             else:
-                inputs.append(word2idx["</s>"])
-                inputs.append(word2idx["<s>"])
-
-                features.append(get_features("</s>"))
-                features.append(get_features("<s>"))
+                words.append("</s>")
+                words.append("<s>")
 
                 targets.append(bio2id["</t>"])
                 targets.append(bio2id["<t>"])
         #end last sentence
-        inputs.append(word2idx["</s>"])
-        features.append(get_features("</s>"))
+        words.append("</s>")
         targets.append(bio2id["</t>"])
-    npinput = np.array(inputs[:-2], dtype=np.int32)
-    npinput.shape = (npinput.shape[0], 1)
-    npfeatures = np.array(features[:-2], dtype=np.int32)
+
     nptargets = np.array(targets[:-2], dtype=np.int32)
-    return np.hstack((npinput, npfeatures)), nptargets
+    return get_all_features(words[:-2]), nptargets
 
 
-def convert_test(filename, word2idx):
+def convert_test(filename):
     #start tags
-    inputs = [word2idx['<s>']]
-    features = [get_features('<s>')]
+    words = ["<s>"]
     with open(filename, 'r') as f:
         for line in f:
             cline = line.split()
             if cline:
                 word = cline[2]
-                #transformation still very basic!
-                cword = transform_word(word)
-                if cword in word2idx:
-                    inputs.append(word2idx[cword])
-                else:
-                    inputs.append(word2idx["<unk>"])
-                features.append(get_features(word))
+                words.append(word)
             else:
-                inputs.append(word2idx["</s>"])
-                inputs.append(word2idx["<s>"])
-                features.append(get_features("</s>"))
-                features.append(get_features("<s>"))
+                words.append("</s>")
+                words.append("<s>")
         #end last sentence
-        inputs.append(word2idx["</s>"])
-        features.append(get_features("</s>"))
-    npinput = np.array(inputs[:-2], dtype=np.int32)
-    npinput.shape = (npinput.shape[0], 1)
-    npfeatures = np.array(features[:-2], dtype=np.int32)
-    return np.hstack((npinput, npfeatures))
+        words.append("</s>")
+    return get_all_features(words[:-2])
 
 
 FILE_PATHS = {"CONLL": ("data/train.num.txt",
@@ -192,17 +254,26 @@ def main(arguments):
                         type=str)
     args = parser.parse_args(arguments)
     dataset = args.dataset
-    train, valid, test, tag_dict = FILE_PATHS[dataset]
 
-    bio2id = generate_bio2id(tag_dict)
+    read_csv("data/countries.txt", countries, ":", 1)
+    read_json("data/cities.txt", cities, encoding="utf_16_le")
+    read_csv("data/cities2.txt", cities2, ",", 1, encoding="latin1")
+    div = lambda a: int(a) * 0.001
+    read_csv("data/names.csv", names, ",", 1, 2, div, encoding="latin1")
+    read_csv("data/firstmale.txt", firstmale, " ", 0, 1, float)
+    read_csv("data/firstfemale.txt", firstfemale, " ", 0, 1, float)
+    read_csv("data/last.txt", last, " ", 0, 1, float)
+
+    train, valid, test, tag_dict = FILE_PATHS[dataset]
+    generate_bio2id(tag_dict)
     embeddings = get_embeddings()
-    word2idx, idx2embedding = get_vocab([train,valid,test], embeddings)
+    idx2embedding = get_vocab([train,valid,test], embeddings)
     #for every sentence, add start and end tag! <s> -> <t>, </s> -> </t>
 
     count_ngrams(train)
-    train_input, train_target = convert_data(train, word2idx, bio2id)
-    valid_input, valid_target = convert_data(valid, word2idx, bio2id)
-    test_input = convert_test(test, word2idx)
+    train_input, train_target = convert_data(train)
+    valid_input, valid_target = convert_data(valid)
+    test_input = convert_test(test)
 
     C = len(bio2id)
     V = len(word2idx)

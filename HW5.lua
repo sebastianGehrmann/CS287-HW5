@@ -9,6 +9,7 @@ cmd = torch.CmdLine()
 cmd:option('-datafile', 'CONLL.hdf5', 'data file')
 cmd:option('-classifier', 'hmm', 'classifier to use')
 cmd:option('-outfile', '', 'output file')
+cmd:option('-use_all', 0, 'Use all data')
 
 -- Hyperparameters
 cmd:option('-beta', 1, 'beta for F-Score')
@@ -16,7 +17,9 @@ cmd:option('-laplace', 1, 'added counts for laplace smoothing')
 cmd:option('-batchsize', 16, 'Batches to train at once')
 cmd:option('-eta', 0.005, 'Training eta')
 cmd:option('-epochs', 40, 'Epochs to train for')
+cmd:option('-nwindow', 7, 'Window size')
 cmd:option('-nembed', 50, 'Embedding layer')
+cmd:option('-nembed2', 20, 'Embedding layer for class')
 cmd:option('-nhidden', 100, 'Hidden layer')
 cmd:option('-use_embedding', 1, 'Use embedding')
 cmd:option('-use_aux', 1, 'Use auxillary features')
@@ -145,18 +148,21 @@ function memm(inputs)
     local model = nn.Sequential()
 
     local concat = nn.ConcatTable()
-    concat:add(nn.Select(2, 1))
-    local naux = inputs:size(2)-2
+    concat:add(nn.Narrow(2, 1, nwindow))
+    local naux = inputs:size(2)-nwindow-1
     if use_aux > 0 then
-        concat:add(nn.Narrow(2, 2, naux))
+        concat:add(nn.Narrow(2, nwindow+1, naux))
     end
     concat:add(nn.Select(2, inputs:size(2)))
     model:add(concat)
 
     local parallel = nn.ParallelTable()
     -- words features
+    local wordtable = nn.Sequential()
     local wordlookup = nn.LookupTable(nwords, nclasses)
-    parallel:add(wordlookup)
+    wordtable:add(wordlookup)
+    wordtable:add(nn.Sum(1, 2))
+    parallel:add(wordtable)
     -- aux features
     if use_aux > 0 then
         parallel:add(nn.Linear(naux, nclasses))
@@ -179,33 +185,36 @@ function memm2(inputs)
     local model = nn.Sequential()
 
     local concat = nn.ConcatTable()
-    concat:add(nn.Select(2, 1))
-    local naux = inputs:size(2)-2
+    concat:add(nn.Narrow(2, 1, nwindow))
+    local naux = inputs:size(2)-nwindow-1
     if use_aux > 0 then
-        concat:add(nn.Narrow(2, 2, naux))
+        concat:add(nn.Narrow(2, nwindow+1, naux))
     end
     concat:add(nn.Select(2, inputs:size(2)))
     model:add(concat)
 
     local parallel = nn.ParallelTable()
     -- words features
+    local wordtable = nn.Sequential()
     local wordlookup = nn.LookupTable(nwords, nembed)
     if use_embedding > 0 then
         wordlookup.weight:copy(embeddings)
     end 
-    parallel:add(wordlookup)
+    wordtable:add(wordlookup)
+    wordtable:add(nn.View(nwindow * nembed):setNumInputDims(2))
+    parallel:add(wordtable)
     -- aux features
     if use_aux > 0 then
         parallel:add(nn.Identity())
     end
     -- prev class features
-    local classlookup = nn.LookupTable(nclasses, nembed)
+    local classlookup = nn.LookupTable(nclasses, nembed2)
     parallel:add(classlookup)
     model:add(parallel)
     
     -- Linear model over the concatenated features
     model:add(nn.JoinTable(1, 1))
-    model:add(nn.Linear(nembed + naux*use_aux + nembed, nhidden))
+    model:add(nn.Linear(nwindow*nembed + naux*use_aux + nembed2, nhidden))
     model:add(nn.HardTanh())
     model:add(nn.Linear(nhidden, nclasses))
     return model
@@ -262,6 +271,9 @@ function viterbi(observations, score_fn)
 
         -- compute new maxes
         maxes, backpointers = scores:max(2)
+        -- Force intermediate tags to not be start/end tags
+        maxes[startclass] = -math.huge
+        maxes[endclass] = -math.huge
 
         -- record
         max_table[i] = maxes
@@ -464,7 +476,9 @@ function main()
     nclasses = f:read('nclasses'):all():long()[1]
     nwords = f:read('nwords'):all():long()[1]
 
+    nwindow = opt.nwindow
     nembed = opt.nembed
+    nembed2 = opt.nembed2
     nhidden = opt.nhidden
     use_embedding = opt.use_embedding
     use_aux = opt.use_aux
@@ -474,9 +488,9 @@ function main()
     startword = 2
     endword = 3
     -- This is the tag for <s>
-    startclass = 8
+    startclass = nclasses - 1
     -- This is the tag for </s>
-    endclass = 9
+    endclass = nclasses
     -- Initial state for HMM
     initial = torch.Tensor(nclasses, 1):fill(0)
     initial[startclass] = 1.0
@@ -496,6 +510,11 @@ function main()
     valid_input = f:read('valid_input'):all():double()
     valid_target = f:read('valid_output'):all():double()
     valid_input, valid_target = reshapeTrainingData(valid_input, valid_target)
+
+    if opt.use_all > 0 then
+        train_input = torch.cat(train_input, valid_input, 1)
+        train_target = torch.cat(train_target, valid_target, 1)
+    end
 
     test_input = f:read('test_input'):all():double()
     -- For consistency
